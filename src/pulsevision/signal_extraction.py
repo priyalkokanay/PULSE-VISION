@@ -8,7 +8,7 @@ import numpy as np
 
 
 class SignalExtractor:
-    """Extract RGB measurements and visible ROI boxes from multiple faces."""
+    """Fast face and skin-region extraction for PulseVision."""
 
     OUTLINE = [
         10, 109, 67, 103, 54, 21, 162, 127, 234,
@@ -17,14 +17,15 @@ class SignalExtractor:
         323, 454, 356, 389, 251, 284, 332, 297, 338,
     ]
 
-    # Region coordinates are relative to eye distance.
+    # Region coordinates are relative to the eye midpoint and eye distance.
+    # The regions are axis-aligned to avoid rotating the entire camera frame.
     REGIONS = {
         "forehead": (-0.55, -0.90, 0.55, -0.48),
         "left_cheek": (-1.05, 0.35, -0.48, 0.78),
         "right_cheek": (0.48, 0.35, 1.05, 0.78),
     }
 
-    def __init__(self, max_faces=8, min_skin_fraction=0.25):
+    def __init__(self, max_faces=2, min_skin_fraction=0.25):
         self.min_skin_fraction = min_skin_fraction
         self.last_timestamp_ms = -1
 
@@ -36,7 +37,7 @@ class SignalExtractor:
 
         if not model_path.exists():
             raise FileNotFoundError(
-                f"Missing face landmark model: {model_path}"
+                f"Missing MediaPipe model: {model_path}"
             )
 
         options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -44,7 +45,7 @@ class SignalExtractor:
                 model_asset_path=str(model_path)
             ),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_faces=max_faces,
+            num_faces=max(1, int(max_faces)),
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -55,12 +56,13 @@ class SignalExtractor:
         )
 
     def close(self):
-        """Release MediaPipe resources."""
-        self.landmarker.close()
+        if self.landmarker is not None:
+            self.landmarker.close()
+            self.landmarker = None
 
     @staticmethod
     def _skin_mask(roi):
-        """Return a simple YCrCb skin-colour mask."""
+        """Return a lightweight YCrCb skin mask for a small BGR ROI."""
         ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
         cr = ycrcb[:, :, 1]
         cb = ycrcb[:, :, 2]
@@ -73,18 +75,31 @@ class SignalExtractor:
         )
 
     @staticmethod
-    def _clip_points(points, width, height):
-        points = np.asarray(points, dtype=np.float32).copy()
-        points[:, 0] = np.clip(points[:, 0], 0, width - 1)
-        points[:, 1] = np.clip(points[:, 1], 0, height - 1)
-        return np.round(points).astype(int)
+    def _clip_box(x1, y1, x2, y2, width, height):
+        x1 = max(0, min(int(round(x1)), width - 1))
+        y1 = max(0, min(int(round(y1)), height - 1))
+        x2 = max(0, min(int(round(x2)), width))
+        y2 = max(0, min(int(round(y2)), height))
+        return x1, y1, x2, y2
 
     def extract(self, frame):
-        """Return face landmarks, ROI boxes, RGB values and timestamps."""
+        """
+        Detect faces and return:
+        - face outline and center
+        - three sampling regions
+        - per-region skin fraction and RGB mean
+        - a timestamp for each detected face
+        """
+        if self.landmarker is None:
+            raise RuntimeError("SignalExtractor is closed")
+
         now = time.perf_counter()
         height, width = frame.shape[:2]
 
+        # MediaPipe expects an RGB image.
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = np.ascontiguousarray(rgb_frame)
+
         image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
             data=rgb_frame,
@@ -104,19 +119,23 @@ class SignalExtractor:
         faces = []
 
         for landmarks in detection.face_landmarks:
-            points = np.array(
-                [[lm.x * width, lm.y * height] for lm in landmarks],
+            points = np.asarray(
+                [(lm.x * width, lm.y * height) for lm in landmarks],
                 dtype=np.float32,
             )
 
+            # Eye centers provide a rough scale for the face sampling regions.
             left_eye = points[[33, 133]].mean(axis=0)
             right_eye = points[[362, 263]].mean(axis=0)
 
             eye_distance = float(
                 np.linalg.norm(right_eye - left_eye)
             )
+
             if eye_distance < 10:
                 continue
+
+            eye_midpoint = (left_eye + right_eye) * 0.5
 
             tilt = float(
                 np.degrees(
@@ -127,77 +146,35 @@ class SignalExtractor:
                 )
             )
 
-            eye_midpoint = (left_eye + right_eye) / 2
-            matrix = cv2.getRotationMatrix2D(
-                tuple(eye_midpoint),
-                tilt,
-                1.0,
+            outline = points[self.OUTLINE]
+            face_polygon = np.round(outline).astype(np.int32)
+            face_polygon[:, 0] = np.clip(
+                face_polygon[:, 0], 0, width - 1
             )
-
-            aligned = cv2.warpAffine(
-                frame,
-                matrix,
-                (width, height),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
-
-            aligned_points = cv2.transform(
-                points.reshape(1, -1, 2),
-                matrix,
-            )[0]
-
-            eye_center = aligned_points[[33, 133, 362, 263]].mean(axis=0)
-            ex, ey = eye_center
-            inverse = cv2.invertAffineTransform(matrix)
-
-            outline = aligned_points[self.OUTLINE]
-            face_polygon = cv2.transform(
-                outline.reshape(1, -1, 2),
-                inverse,
-            )[0]
-            face_polygon = self._clip_points(
-                face_polygon, width, height
+            face_polygon[:, 1] = np.clip(
+                face_polygon[:, 1], 0, height - 1
             )
 
             measurements = []
             valid_rgb_values = []
 
-            for name, (rx1, ry1, rx2, ry2) in self.REGIONS.items():
-                x1 = int(round(ex + rx1 * eye_distance))
-                y1 = int(round(ey + ry1 * eye_distance))
-                x2 = int(round(ex + rx2 * eye_distance))
-                y2 = int(round(ey + ry2 * eye_distance))
+            eye_x, eye_y = eye_midpoint
 
-                x1 = max(0, min(x1, width - 1))
-                y1 = max(0, min(y1, height - 1))
-                x2 = max(0, min(x2, width))
-                y2 = max(0, min(y2, height))
+            for name, (rx1, ry1, rx2, ry2) in self.REGIONS.items():
+                x1, y1, x2, y2 = self._clip_box(
+                    eye_x + rx1 * eye_distance,
+                    eye_y + ry1 * eye_distance,
+                    eye_x + rx2 * eye_distance,
+                    eye_y + ry2 * eye_distance,
+                    width,
+                    height,
+                )
 
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                # Keep region boxes in original camera-frame coordinates.
-                corners = np.array(
-                    [
-                        [x1, y1],
-                        [x2, y1],
-                        [x2, y2],
-                        [x1, y2],
-                    ],
-                    dtype=np.float32,
-                )
+                roi = frame[y1:y2, x1:x2]
 
-                original_corners = cv2.transform(
-                    corners.reshape(1, -1, 2),
-                    inverse,
-                )[0]
-
-                box = self._clip_points(
-                    original_corners, width, height
-                )
-
-                roi = aligned[y1:y2, x1:x2]
                 if roi.size == 0:
                     continue
 
@@ -208,14 +185,27 @@ class SignalExtractor:
 
                 if valid:
                     pixels = roi[mask]
+
                     if pixels.size:
-                        # Convert OpenCV BGR channel order to RGB.
-                        mean_rgb = pixels.mean(axis=0)[::-1].copy()
+                        # OpenCV uses BGR; PulseVision stores RGB.
+                        mean_rgb = pixels.mean(axis=0)[::-1].astype(
+                            np.float64
+                        )
                         valid_rgb_values.append(mean_rgb)
                     else:
                         valid = False
 
-                # Preserve boxes even if skin detection rejects the ROI.
+                # Axis-aligned boxes keep drawing and frontend data simple.
+                box = np.asarray(
+                    [
+                        [x1, y1],
+                        [x2, y1],
+                        [x2, y2],
+                        [x1, y2],
+                    ],
+                    dtype=np.int32,
+                )
+
                 measurements.append({
                     "name": name,
                     "box": box,
@@ -224,7 +214,7 @@ class SignalExtractor:
                     "valid": valid,
                 })
 
-            rgb = (
+            face_rgb = (
                 np.mean(valid_rgb_values, axis=0)
                 if valid_rgb_values
                 else None
@@ -239,12 +229,10 @@ class SignalExtractor:
                 "face_polygon": face_polygon,
                 "tilt": tilt,
                 "regions": measurements,
-                "rgb": rgb,
-                "valid_regions": len(valid_rgb_values),
+                "rgb": face_rgb,
             })
 
-        # Temporary left-to-right ordering only.
-        # PersonTracker should handle persistent tracking IDs.
+        # Temporary deterministic order; PersonTracker assigns persistent IDs.
         faces.sort(key=lambda face: face["center"][0])
 
         for index, face in enumerate(faces, start=1):

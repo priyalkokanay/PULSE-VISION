@@ -1,4 +1,3 @@
-
 from collections import deque
 import math
 import time
@@ -16,29 +15,23 @@ class PersonTracker:
         self.buffer_seconds = buffer_seconds
         self.expected_fps = expected_fps
         self.max_missing_seconds = max_missing_seconds
-
         self.tracks = {}
         self.next_track_id = 1
-
-        self.max_samples = max(
-            1, int(buffer_seconds * expected_fps)
-        )
+        self.max_samples = max(1, int(buffer_seconds * expected_fps))
 
     @staticmethod
     def _bbox(face):
         polygon = face.get("face_polygon")
-
         if polygon is None or len(polygon) == 0:
             return None
 
         points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
-
-        x1 = float(np.min(points[:, 0]))
-        y1 = float(np.min(points[:, 1]))
-        x2 = float(np.max(points[:, 0]))
-        y2 = float(np.max(points[:, 1]))
-
-        return x1, y1, x2, y2
+        return (
+            float(np.min(points[:, 0])),
+            float(np.min(points[:, 1])),
+            float(np.max(points[:, 0])),
+            float(np.max(points[:, 1])),
+        )
 
     @staticmethod
     def _center(bbox):
@@ -56,10 +49,8 @@ class PersonTracker:
         iy2 = min(ay2, by2)
 
         intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
         area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
         area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-
         union = area_a + area_b - intersection
 
         return intersection / union if union > 0 else 0.0
@@ -80,80 +71,96 @@ class PersonTracker:
 
         return track_id
 
-    def _add_sample(self, track, face):
+    def _add_sample(self, track, face, timestamp):
         rgb = face.get("rgb")
 
         if rgb is None:
             return
 
         try:
-            values = np.asarray(rgb, dtype=float)
+            values = np.asarray(rgb, dtype=float).reshape(-1)
 
-            if values.size == 3 and np.all(np.isfinite(values)):
-                track["buffer"].append({
-                    "timestamp": face.get("timestamp", time.time()),
-                    "rgb": values.tolist(),
-                })
-        except (TypeError, ValueError):
-            pass
+            if (
+                values.size != 3
+                or not np.isfinite(timestamp)
+                or not np.all(np.isfinite(values))
+            ):
+                return
+
+            buffer = track["buffer"]
+
+            if buffer and timestamp <= buffer[-1]["timestamp"]:
+                return
+
+            buffer.append({
+                "timestamp": float(timestamp),
+                "rgb": values.tolist(),
+            })
+
+        except (TypeError, ValueError, KeyError):
+            return
 
     def update(self, detections, now=None):
         if now is None:
             now = time.perf_counter()
 
-        # Keep temporarily missing tracks for 10 seconds.
-        expired_ids = [
+        now = float(now)
+
+        # Remove tracks that have been missing too long.
+        expired = [
             track_id
             for track_id, track in self.tracks.items()
             if now - track["last_seen"] > self.max_missing_seconds
         ]
 
-        for track_id in expired_ids:
+        for track_id in expired:
             del self.tracks[track_id]
 
-        detections = list(detections or [])
+        valid_detections = []
+        for face in detections:
+            bbox = self._bbox(face)
+            if bbox is not None:
+                valid_detections.append((face, bbox))
+
         unmatched_tracks = set(self.tracks.keys())
-        unmatched_detections = set(range(len(detections)))
+        unmatched_detections = set(range(len(valid_detections)))
         assignments = {}
 
-        # Build possible matches between existing tracks and detections.
+        # Match detections to existing tracks using bounding-box overlap
+        # and center distance.
         candidates = []
 
-        for track_id, track in self.tracks.items():
-            old_bbox = track["bbox"]
-            old_center = track["center"]
+        for index, (face, bbox) in enumerate(valid_detections):
+            center = self._center(bbox)
 
-            if old_bbox is None or old_center is None:
-                continue
+            for track_id in unmatched_tracks:
+                track = self.tracks[track_id]
+                previous_bbox = track.get("bbox")
+                previous_center = track.get("center")
 
-            elapsed = max(0.0, now - track["last_seen"])
-
-            for index, face in enumerate(detections):
-                new_bbox = self._bbox(face)
-
-                if new_bbox is None:
+                if previous_bbox is None or previous_center is None:
                     continue
 
-                new_center = self._center(new_bbox)
+                overlap = self._iou(previous_bbox, bbox)
 
-                distance = math.dist(old_center, new_center)
-                iou = self._iou(old_bbox, new_bbox)
-
-                old_width = max(1.0, old_bbox[2] - old_bbox[0])
-                old_height = max(1.0, old_bbox[3] - old_bbox[1])
-                face_scale = max(old_width, old_height)
-
-                # Allow more movement after a longer disappearance.
-                distance_limit = face_scale * (
-                    1.0 + 1.5 * elapsed
+                distance = math.dist(center, previous_center)
+                scale = max(
+                    1.0,
+                    math.dist(
+                        (previous_bbox[0], previous_bbox[1]),
+                        (previous_bbox[2], previous_bbox[3]),
+                    ),
                 )
 
-                if distance <= distance_limit or iou > 0.05:
-                    normalized_distance = distance / face_scale
-                    score = normalized_distance - (2.0 * iou)
+                normalized_distance = distance / scale
+
+                if overlap >= 0.05 or normalized_distance <= 0.8:
+                    score = (
+                        0.7 * (1.0 - overlap)
+                        + 0.3 * min(normalized_distance, 2.0)
+                    )
                     candidates.append((score, track_id, index))
 
-        # Greedy one-to-one matching: each track and face can be used once.
         candidates.sort(key=lambda item: item[0])
 
         for score, track_id, index in candidates:
@@ -165,27 +172,27 @@ class PersonTracker:
                 unmatched_tracks.remove(track_id)
                 unmatched_detections.remove(index)
 
-        # Assign new IDs to detections that did not match an existing track.
+        # Create tracks for newly detected people.
         for index in sorted(unmatched_detections):
-            assignments[index] = self._new_track(detections[index], now)
+            face, bbox = valid_detections[index]
+            assignments[index] = self._new_track(face, now)
 
         results = []
 
-        for index, face in enumerate(detections):
+        for index, (face, bbox) in enumerate(valid_detections):
             track_id = assignments[index]
             track = self.tracks[track_id]
 
-            bbox = self._bbox(face)
-
-            if bbox is not None:
-                track["bbox"] = bbox
-                track["center"] = self._center(bbox)
-
+            track["bbox"] = bbox
+            track["center"] = self._center(bbox)
             track["last_seen"] = now
-            self._add_sample(track, face)
+
+            # Use one monotonic clock for both tracking and signal samples.
+            self._add_sample(track, face, now)
 
             result = dict(face)
             result["track_id"] = track_id
+            result["timestamp"] = now
             result["buffer"] = track["buffer"]
             result["buffer_samples"] = len(track["buffer"])
             result["tracking_missing_seconds"] = 0.0

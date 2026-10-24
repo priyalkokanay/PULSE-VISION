@@ -1,5 +1,5 @@
-
 from dataclasses import dataclass
+
 import numpy as np
 from scipy.signal import butter, detrend, find_peaks, sosfiltfilt
 
@@ -13,14 +13,7 @@ class PulseResult:
 
 
 class POSEngine:
-    """
-    Experimental POS-based remote photoplethysmography (rPPG).
-
-    Input: RGB samples shaped (N, 3), ordered as red, green, blue.
-    Output: estimated BPM, a rough signal-quality score, and waveform.
-
-    This is a prototype, not a medical measurement device.
-    """
+    """Experimental POS-based remote pulse estimator."""
 
     def __init__(
         self,
@@ -29,177 +22,366 @@ class POSEngine:
         min_seconds=20,
         max_seconds=30,
     ):
-        self.min_bpm = min_bpm
-        self.max_bpm = max_bpm
-        self.min_seconds = min_seconds
-        self.max_seconds = max_seconds
+        self.min_bpm = float(min_bpm)
+        self.max_bpm = float(max_bpm)
+        self.min_seconds = float(min_seconds)
+        self.max_seconds = float(max_seconds)
 
     @staticmethod
-    def _resample(timestamps, rgb, fs):
-        timestamps = np.asarray(timestamps, dtype=float)
+    def _fail(status, waveform=None, quality=0.0):
+        return PulseResult(
+            None,
+            float(quality),
+            status,
+            np.asarray(
+                waveform if waveform is not None else [],
+                dtype=float,
+            ),
+        )
+
+    @staticmethod
+    def _clean_samples(timestamps, rgb):
+        timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
         rgb = np.asarray(rgb, dtype=float)
+
+        if rgb.ndim != 2 or rgb.shape[1] != 3:
+            return None, None
+
+        if len(timestamps) != len(rgb):
+            return None, None
 
         valid = (
             np.isfinite(timestamps)
             & np.all(np.isfinite(rgb), axis=1)
         )
+
         timestamps = timestamps[valid]
         rgb = rgb[valid]
 
-        if len(timestamps) < 2:
+        if len(timestamps) < 3:
             return None, None
 
         order = np.argsort(timestamps)
         timestamps = timestamps[order]
         rgb = rgb[order]
 
-        # Remove duplicate timestamps.
-        timestamps, unique_indices = np.unique(
-            timestamps, return_index=True
+        unique_times, inverse = np.unique(
+            timestamps,
+            return_inverse=True,
         )
-        rgb = rgb[unique_indices]
 
-        if len(timestamps) < 2:
+        if len(unique_times) != len(timestamps):
+            sums = np.zeros((len(unique_times), 3))
+            counts = np.zeros(len(unique_times))
+            np.add.at(sums, inverse, rgb)
+            np.add.at(counts, inverse, 1)
+            rgb = sums / counts[:, None]
+            timestamps = unique_times
+
+        if len(timestamps) < 3 or timestamps[-1] <= timestamps[0]:
             return None, None
+
+        return timestamps, rgb
+
+    def _resample(self, timestamps, rgb):
+        timestamps, rgb = self._clean_samples(timestamps, rgb)
+
+        if timestamps is None:
+            return None, None, None, "Insufficient valid samples"
 
         duration = timestamps[-1] - timestamps[0]
-        if duration <= 0:
-            return None, None
+
+        if duration < self.min_seconds:
+            return None, None, None, "Collecting signal"
+
+        intervals = np.diff(timestamps)
+        intervals = intervals[
+            np.isfinite(intervals) & (intervals > 0)
+        ]
+
+        if len(intervals) < 2:
+            return None, None, None, "Invalid sample timestamps"
+
+        median_interval = float(np.median(intervals))
+        measured_fps = 1.0 / median_interval
+
+        if not np.isfinite(measured_fps) or measured_fps < 5:
+            return None, None, measured_fps, "Sampling rate too low"
+
+        gaps = np.diff(timestamps)
+        gap_fraction = float(
+            np.mean(gaps > max(0.5, 3.0 * median_interval))
+        )
+
+        if gap_fraction > 0.10:
+            return None, None, measured_fps, "Too many dropped frames"
+
+        fps = min(measured_fps, 15.0)
 
         uniform_times = np.arange(
             timestamps[0],
             timestamps[-1],
-            1.0 / fs,
+            1.0 / fps,
         )
 
-        if len(uniform_times) < 2:
-            return None, None
+        if len(uniform_times) < int(self.min_seconds * fps):
+            return None, None, fps, "Collecting signal"
 
         uniform_rgb = np.column_stack([
-            np.interp(uniform_times, timestamps, rgb[:, channel])
+            np.interp(
+                uniform_times,
+                timestamps,
+                rgb[:, channel],
+            )
             for channel in range(3)
         ])
 
-        return uniform_times, uniform_rgb
+        return uniform_times, uniform_rgb, fps, None
 
-    def _pos(self, rgb):
-        # Normalize each colour channel by its temporal mean.
+    @staticmethod
+    def _pos(rgb):
         means = np.mean(rgb, axis=0)
-        if np.any(means <= 1e-8):
+
+        if not np.all(np.isfinite(means)) or np.any(means <= 1e-8):
             return None
 
         normalized = rgb / means - 1.0
         red, green, blue = normalized.T
 
-        # POS projection.
         x = green - blue
         y = green + blue - 2.0 * red
 
-        std_x = np.std(x)
-        std_y = np.std(y)
+        std_x = float(np.std(x))
+        std_y = float(np.std(y))
 
         if std_x < 1e-8 or std_y < 1e-8:
             return None
 
-        alpha = std_x / std_y
-        pulse = x + alpha * y
+        return detrend(
+            x + (std_x / std_y) * y,
+            type="linear",
+        )
 
-        return detrend(pulse, type="linear")
+    @staticmethod
+    def _interpolated_peak(frequencies, power, index):
+        if index <= 0 or index >= len(power) - 1:
+            return float(frequencies[index])
 
-    def estimate(self, timestamps, rgb, fs=30.0):
-        """
-        timestamps: seconds from a consistent clock, shape (N,)
-        rgb: per-frame RGB means, shape (N, 3)
-        fs: target resampling frequency in Hz
-        """
-        times, samples = self._resample(timestamps, rgb, fs)
+        values = np.log(
+            np.maximum(power[index - 1:index + 2], 1e-12)
+        )
 
-        if times is None:
-            return PulseResult(
-                None, 0.0, "Insufficient data", np.array([])
-            )
+        y0, y1, y2 = values
+        denominator = y0 - 2.0 * y1 + y2
 
-        duration = times[-1] - times[0]
+        if abs(denominator) < 1e-12:
+            return float(frequencies[index])
 
-        if duration < self.min_seconds:
-            return PulseResult(
-                None, 0.0, "Collecting signal", np.array([])
-            )
+        offset = 0.5 * (y0 - y2) / denominator
+        offset = float(np.clip(offset, -1.0, 1.0))
 
-        # Use the latest portion of the recording.
+        spacing = frequencies[1] - frequencies[0]
+
+        return float(
+            frequencies[index] + offset * spacing
+        )
+
+    def estimate(self, timestamps, rgb, fs=None):
+        times, samples, fps, error = self._resample(
+            timestamps,
+            rgb,
+        )
+
+        if error:
+            return self._fail(error)
+
+        if times is None or samples is None or fps is None:
+            return self._fail("Insufficient valid samples")
+
         keep = times >= times[-1] - self.max_seconds
         times = times[keep]
         samples = samples[keep]
 
+        duration = float(times[-1] - times[0])
+
+        if duration < self.min_seconds:
+            return self._fail("Collecting signal")
+
         pulse = self._pos(samples)
 
         if pulse is None:
-            return PulseResult(
-                None, 0.0, "Poor RGB signal", np.array([])
-            )
+            return self._fail("Poor RGB signal")
 
         low_hz = self.min_bpm / 60.0
-        high_hz = self.max_bpm / 60.0
+        high_hz = min(self.max_bpm / 60.0, fps * 0.45)
+
+        if high_hz <= low_hz:
+            return self._fail("Sampling rate insufficient")
 
         try:
             sos = butter(
                 3,
                 [low_hz, high_hz],
                 btype="bandpass",
-                fs=fs,
+                fs=fps,
                 output="sos",
             )
+
             filtered = sosfiltfilt(sos, pulse)
-        except ValueError:
-            return PulseResult(
-                None, 0.0, "Signal window too short", pulse
-            )
+
+        except (ValueError, FloatingPointError):
+            return self._fail("Signal window too short", pulse)
 
         filtered = detrend(filtered, type="linear")
-        amplitude = np.std(filtered)
+        amplitude = float(np.std(filtered))
 
-        if not np.isfinite(amplitude) or amplitude < 1e-6:
-            return PulseResult(
-                None, 0.0, "Weak pulse signal", filtered
+        if not np.isfinite(amplitude) or amplitude < 1e-7:
+            return self._fail("Weak pulse signal", filtered)
+
+        sample_count = len(filtered)
+        segment_len = min(
+            sample_count,
+            max(int(10 * fps), int(0.6 * sample_count)),
+        )
+
+        if segment_len < int(self.min_seconds * fps * 0.75):
+            segment_len = sample_count
+
+        step = max(1, segment_len // 2)
+        power_sum = None
+        segment_count = 0
+
+        for start in range(
+            0,
+            sample_count - segment_len + 1,
+            step,
+        ):
+            segment = filtered[start:start + segment_len]
+            segment = (segment - np.mean(segment)) * np.hanning(
+                len(segment)
             )
 
-        # Window the waveform before calculating its spectrum.
-        windowed = filtered * np.hanning(len(filtered))
-        spectrum = np.abs(np.fft.rfft(windowed)) ** 2
-        frequencies = np.fft.rfftfreq(len(windowed), d=1.0 / fs)
+            power = np.abs(np.fft.rfft(segment)) ** 2
 
-        band = (frequencies >= low_hz) & (frequencies <= high_hz)
-        band_indices = np.flatnonzero(band)
-
-        if len(band_indices) < 2:
-            return PulseResult(
-                None, 0.0, "Insufficient frequency resolution", filtered
+            power_sum = (
+                power
+                if power_sum is None
+                else power_sum + power
             )
 
-        band_power = spectrum[band]
-        peak_index = int(np.argmax(band_power))
-        peak_bin = band_indices[peak_index]
-        peak_hz = frequencies[peak_bin]
+            segment_count += 1
 
-        if peak_hz <= 0:
-            return PulseResult(
-                None, 0.0, "No credible pulse peak", filtered
+        if power_sum is None:
+            segment = (
+                filtered - np.mean(filtered)
+            ) * np.hanning(sample_count)
+
+            power_sum = np.abs(np.fft.rfft(segment)) ** 2
+        else:
+            power_sum /= max(1, segment_count)
+
+        frequencies = np.fft.rfftfreq(
+            segment_len,
+            d=1.0 / fps,
+        )
+
+        band = (
+            (frequencies >= low_hz)
+            & (frequencies <= high_hz)
+        )
+
+        indices = np.flatnonzero(band)
+
+        if len(indices) < 3:
+            return self._fail(
+                "Insufficient frequency resolution",
+                filtered,
             )
+
+        band_power = power_sum[band]
+        peak_index = int(indices[int(np.argmax(band_power))])
+
+        peak_hz = self._interpolated_peak(
+            frequencies,
+            power_sum,
+            peak_index,
+        )
+
+        if not np.isfinite(peak_hz) or peak_hz <= 0:
+            return self._fail("No credible pulse peak", filtered)
 
         total_power = float(np.sum(band_power))
-        peak_power = float(spectrum[peak_bin])
-        quality = (
-            peak_power / total_power if total_power > 0 else 0.0
-        )
-        quality = float(np.clip(quality, 0.0, 1.0))
+        peak_power = float(power_sum[peak_index])
 
-        # This is only a rough spectral concentration score,
-        # not a calibrated probability of correctness.
-        bpm = float(peak_hz * 60.0)
+        quality = (
+            peak_power / total_power
+            if total_power > 0
+            else 0.0
+        )
+
+        quality = float(np.clip(quality, 0.0, 1.0))
+        spectral_bpm = peak_hz * 60.0
+
+        peaks, _ = find_peaks(
+            filtered,
+            distance=max(1, int(0.33 * fps)),
+        )
+
+        peak_bpm = None
+
+        if len(peaks) >= 4:
+            intervals = np.diff(peaks) / fps
+
+            intervals = intervals[
+                (intervals >= 60.0 / self.max_bpm)
+                & (intervals <= 60.0 / self.min_bpm)
+            ]
+
+            if len(intervals) >= 3:
+                peak_bpm = 60.0 / float(np.median(intervals))
+
+        # Keep a provisional reading visible but flag disagreement.
+        if quality < 0.03:
+            return self._fail(
+                "Very low signal quality; hold still",
+                filtered,
+                quality,
+            )
+
+        if (
+            peak_bpm is not None
+            and abs(spectral_bpm - peak_bpm) > 12.0
+        ):
+            return PulseResult(
+                round(float(spectral_bpm), 1),
+                round(quality, 3),
+                "Unstable provisional estimate; hold still",
+                filtered,
+            )
+
+        if quality < 0.08:
+            return PulseResult(
+                round(float(spectral_bpm), 1),
+                round(quality, 3),
+                "Low signal quality; provisional estimate",
+                filtered,
+            )
+
+        bpm = (
+            spectral_bpm
+            if peak_bpm is None
+            else 0.7 * spectral_bpm + 0.3 * peak_bpm
+        )
+
+        status = (
+            "Experimental estimate"
+            if quality >= 0.15
+            else "Low-quality experimental estimate"
+        )
 
         return PulseResult(
-            round(bpm, 1),
+            round(float(bpm), 1),
             round(quality, 3),
-            "Experimental estimate",
+            status,
             filtered,
         )
