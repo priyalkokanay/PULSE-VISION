@@ -9,9 +9,11 @@ from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from src.pulsevision import database
 from src.pulsevision.signal_extraction import SignalExtractor
 from src.pulsevision.tracking import PersonTracker
 from src.pulsevision.pos_engine import POSEngine
@@ -22,6 +24,11 @@ class PulseVisionBackend:
         self.extractor = None
         self.tracker = None
         self.camera = None
+        self.worker = None
+
+        self.lock = threading.RLock()
+        self.running = False
+        self.stop_event = threading.Event()
 
         self.engine = POSEngine(
             min_bpm=45,
@@ -30,10 +37,12 @@ class PulseVisionBackend:
             max_seconds=30,
         )
 
-        self.lock = threading.RLock()
-        self.running = False
-        self.worker = None
-        self.stop_event = threading.Event()
+        # These IDs only last for the current camera run.
+        self.track_patient_ids = {}
+        self.patient_sessions = {}
+        self.patient_last_saved = {}
+        self.last_estimate_time = {}
+        self.last_results = {}
 
         self.latest_frame = None
         self.latest_data = {
@@ -46,8 +55,6 @@ class PulseVisionBackend:
 
         self.rows = []
         self.started_at = None
-        self.last_estimate_time = {}
-        self.last_results = {}
         self.processing_fps = 0.0
 
     def start(self):
@@ -55,54 +62,89 @@ class PulseVisionBackend:
             if self.running:
                 return
 
-            extractor = SignalExtractor()
-            camera = cv2.VideoCapture(0, cv2.CAP_MSMF)
+            extractor = None
+            camera = None
 
-            if not camera.isOpened():
-                camera.release()
-                camera = cv2.VideoCapture(0)
+            try:
+                # No face-recognition model is loaded here.
+                extractor = SignalExtractor()
 
-            if not camera.isOpened():
-                extractor.close()
-                raise RuntimeError(
-                    "Unable to open webcam. Close other apps using it."
+                for backend_id in (
+                    cv2.CAP_DSHOW,
+                    cv2.CAP_MSMF,
+                    cv2.CAP_ANY,
+                ):
+                    candidate = cv2.VideoCapture(0, backend_id)
+
+                    if candidate.isOpened():
+                        camera = candidate
+                        break
+
+                    candidate.release()
+
+                if camera is None or not camera.isOpened():
+                    raise RuntimeError(
+                        "Could not open the webcam. Close other apps "
+                        "using the camera and try again."
+                    )
+
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                camera.set(cv2.CAP_PROP_FPS, 30)
+                camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                self.extractor = extractor
+                self.camera = camera
+                self.tracker = PersonTracker(
+                    buffer_seconds=30,
+                    expected_fps=30,
+                    max_missing_seconds=10,
                 )
 
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            camera.set(cv2.CAP_PROP_FPS, 30)
-            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.track_patient_ids.clear()
+                self.patient_sessions.clear()
+                self.patient_last_saved.clear()
+                self.last_estimate_time.clear()
+                self.last_results.clear()
+                self.rows = []
 
-            self.extractor = extractor
-            self.tracker = PersonTracker(
-                buffer_seconds=30,
-                expected_fps=30,
-                max_missing_seconds=10,
-            )
-            self.camera = camera
-            self.running = True
-            self.stop_event.clear()
-            self.started_at = time.perf_counter()
-            self.rows = []
-            self.last_estimate_time = {}
-            self.last_results = {}
-            self.processing_fps = 0.0
+                self.stop_event.clear()
+                self.started_at = time.perf_counter()
+                self.processing_fps = 0.0
+                self.latest_frame = None
+                self.latest_data = {
+                    "connected": True,
+                    "status": "Collecting signal",
+                    "fps": 0.0,
+                    "people": [],
+                    "session_seconds": 0,
+                }
 
-            self.latest_frame = None
-            self.latest_data = {
-                "connected": True,
-                "status": "Collecting signal",
-                "fps": 0.0,
-                "people": [],
-                "session_seconds": 0,
-            }
+                self.running = True
+                self.worker = threading.Thread(
+                    target=self._capture_loop,
+                    daemon=True,
+                    name="PulseVisionCapture",
+                )
+                self.worker.start()
 
-            self.worker = threading.Thread(
-                target=self._capture_loop,
-                daemon=True,
-                name="PulseVisionCapture",
-            )
-            self.worker.start()
+            except Exception:
+                self.running = False
+                self.stop_event.set()
+
+                if camera is not None:
+                    camera.release()
+
+                if extractor is not None:
+                    try:
+                        extractor.close()
+                    except Exception:
+                        pass
+
+                self.camera = None
+                self.extractor = None
+                self.tracker = None
+                raise
 
     def stop(self):
         with self.lock:
@@ -111,25 +153,35 @@ class PulseVisionBackend:
 
             self.running = False
             self.stop_event.set()
+
             camera = self.camera
-            self.camera = None
             worker = self.worker
+            self.camera = None
 
         if camera is not None:
             camera.release()
 
         if worker is not None and worker.is_alive():
-            worker.join(timeout=3)
+            worker.join(timeout=5)
+
+        for session_id in list(self.patient_sessions.values()):
+            try:
+                database.end_session(session_id)
+            except Exception as exc:
+                print(f"[PulseVision] Could not close session: {exc}")
 
         with self.lock:
-            if self.extractor is not None:
-                self.extractor.close()
-                self.extractor = None
-
+            extractor = self.extractor
+            self.extractor = None
             self.tracker = None
             self.worker = None
-            self.last_results.clear()
+
+            self.track_patient_ids.clear()
+            self.patient_sessions.clear()
+            self.patient_last_saved.clear()
             self.last_estimate_time.clear()
+            self.last_results.clear()
+
             self.latest_frame = None
             self.latest_data = {
                 "connected": False,
@@ -139,126 +191,287 @@ class PulseVisionBackend:
                 "session_seconds": 0,
             }
 
+        if extractor is not None:
+            try:
+                extractor.close()
+            except Exception as exc:
+                print(f"[PulseVision] Extractor shutdown warning: {exc}")
+
+    def _create_patient_for_track(self, frame, face, track_id):
+        """
+        Save one patient photo per live tracking ID.
+
+        This intentionally does not claim to recognize a person across
+        separate camera sessions.
+        """
+        key = str(track_id)
+
+        if key in self.track_patient_ids:
+            return self.track_patient_ids[key]
+
+        polygon = face.get("face_polygon")
+        if polygon is None:
+            return None
+
+        try:
+            points = np.asarray(polygon, dtype=np.int32).reshape(-1, 2)
+            if len(points) < 3:
+                return None
+
+            x, y, width, height = cv2.boundingRect(points)
+
+            if width < 40 or height < 40:
+                return None
+
+            padding = 20
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(frame.shape[1], x + width + padding)
+            y2 = min(frame.shape[0], y + height + padding)
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+
+            success, encoded = cv2.imencode(
+                ".jpg",
+                crop,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+            if not success:
+                return None
+
+            photo = (
+                "data:image/jpeg;base64,"
+                + base64.b64encode(encoded.tobytes()).decode("ascii")
+            )
+
+            patient = database.create_automatic_patient(
+                face_photo=photo,
+            )
+
+            if not patient or not patient.get("patient_id"):
+                raise RuntimeError(
+                    "The database did not return a patient ID."
+                )
+
+            patient_id = patient["patient_id"]
+            session_id = database.create_session(patient_id)
+
+            self.track_patient_ids[key] = patient_id
+            self.patient_sessions[key] = session_id
+            self.patient_last_saved[key] = 0
+
+            print(
+                f"[PulseVision] Saved face photo for "
+                f"{patient.get('person_label', patient.get('name', patient_id))}"
+            )
+            return patient_id
+
+        except Exception as exc:
+            print(f"[PulseVision] Patient auto-save failed: {exc}")
+            return None
+
+    def _save_reading(self, track_id, patient_id, result):
+        if not patient_id or result is None:
+            return
+
+        try:
+            bpm = getattr(result, "bpm", None)
+            quality = getattr(result, "signal_quality", None)
+
+            if bpm is None:
+                return
+
+            bpm = float(bpm)
+            if not np.isfinite(bpm) or not 35 <= bpm <= 220:
+                return
+
+            if quality is not None:
+                quality = float(quality)
+                if not np.isfinite(quality):
+                    quality = None
+
+            key = str(track_id)
+            now = time.time()
+
+            # Save at most one reading per track every five seconds.
+            if now - self.patient_last_saved.get(key, 0) < 5:
+                return
+
+            database.save_reading(
+                patient_id=patient_id,
+                heart_rate=bpm,
+                confidence=quality,
+                signal_quality=quality,
+                session_id=self.patient_sessions.get(key),
+                raw_data={
+                    "source": "webcam",
+                    "tracking_id": key,
+                    "method": "experimental_rppg",
+                },
+            )
+
+            self.patient_last_saved[key] = now
+            print(
+                f"[PulseVision] Saved {bpm:.1f} BPM "
+                f"for patient {patient_id}"
+            )
+
+        except Exception as exc:
+            print(f"[PulseVision] BPM database save failed: {exc}")
+
     def _capture_loop(self):
         frame_count = 0
         fps_started = time.perf_counter()
-        last_publish = 0.0
-        cached_frame_b64 = None
+        cached_frame = None
 
         while not self.stop_event.is_set():
-            with self.lock:
-                camera = self.camera
-                extractor = self.extractor
-                tracker = self.tracker
+            camera = self.camera
+            extractor = self.extractor
+            tracker = self.tracker
 
             if camera is None or extractor is None or tracker is None:
                 break
 
-            ok, frame = camera.read()
-            if not ok:
+            success, frame = camera.read()
+
+            if not success:
                 with self.lock:
                     self.latest_data["status"] = "Camera frame capture failed"
                 time.sleep(0.03)
                 continue
 
             frame = cv2.flip(frame, 1)
-            frame_time = time.perf_counter()
+            now = time.perf_counter()
 
             try:
                 detections = extractor.extract(frame)
-                tracked_people = tracker.update(detections, now=frame_time)
+                tracked_people = tracker.update(detections, now=now)
             except Exception as exc:
                 with self.lock:
                     self.latest_data["status"] = f"Pipeline error: {exc}"
+                print(f"[PulseVision] Detection error: {exc}")
                 time.sleep(0.03)
                 continue
 
             frame_count += 1
-            elapsed_fps = frame_time - fps_started
-            if elapsed_fps >= 1.0:
-                self.processing_fps = frame_count / elapsed_fps
+            elapsed = now - fps_started
+
+            if elapsed >= 1:
+                self.processing_fps = frame_count / elapsed
                 frame_count = 0
-                fps_started = frame_time
+                fps_started = now
 
             people_data = []
 
             for face in tracked_people:
-                person_id = face.get("track_id", face.get("person_id", 0))
-                samples = list(face.get("buffer", []))
-                result = self.last_results.get(person_id)
+                track_id = face.get(
+                    "track_id",
+                    face.get("person_id", face.get("id")),
+                )
+                if track_id is None:
+                    continue
 
-                sample_times = [
-                    float(sample["timestamp"])
-                    for sample in samples
-                    if isinstance(sample, dict)
-                    and isinstance(sample.get("timestamp"), (int, float))
-                    and np.isfinite(sample["timestamp"])
+                patient_id = self._create_patient_for_track(
+                    frame,
+                    face,
+                    track_id,
+                )
+
+                samples = list(face.get("buffer", []))
+                timestamps = [
+                    float(s["timestamp"])
+                    for s in samples
+                    if isinstance(s, dict)
+                    and isinstance(s.get("timestamp"), (int, float))
+                    and np.isfinite(s["timestamp"])
                 ]
 
                 signal_seconds = (
-                    max(sample_times) - min(sample_times)
-                    if len(sample_times) >= 2
+                    max(timestamps) - min(timestamps)
+                    if len(timestamps) >= 2
                     else 0.0
                 )
                 signal_seconds = max(0.0, float(signal_seconds))
 
-                # Recompute at most once per second after enough data exists.
+                result = self.last_results.get(track_id)
+
                 if (
-                    signal_seconds >= 20.0
-                    and frame_time - self.last_estimate_time.get(person_id, 0)
-                    >= 1.0
+                    signal_seconds >= 20
+                    and now - self.last_estimate_time.get(track_id, 0) >= 1
                 ):
                     try:
-                        usable_samples = [
-                            sample for sample in samples
-                            if isinstance(sample, dict)
-                            and "timestamp" in sample
-                            and "rgb" in sample
-                        ]
-                        estimate_times = [
-                            sample["timestamp"] for sample in usable_samples
-                        ]
-                        rgb_values = [
-                            sample["rgb"] for sample in usable_samples
+                        usable = [
+                            s for s in samples
+                            if isinstance(s, dict)
+                            and "timestamp" in s
+                            and "rgb" in s
                         ]
 
-                        new_result = self.engine.estimate(
-                            estimate_times,
-                            rgb_values,
-                            fs=30.0,
-                        )
+                        if len(usable) >= 2:
+                            result = self.engine.estimate(
+                                [s["timestamp"] for s in usable],
+                                [s["rgb"] for s in usable],
+                                fs=30.0,
+                            )
 
-                        self.last_results[person_id] = new_result
-                        self.last_estimate_time[person_id] = frame_time
-                        result = new_result
+                            self.last_results[track_id] = result
+                            self.last_estimate_time[track_id] = now
 
-                        with self.lock:
-                            self.rows.append({
-                                "timestamp": time.time(),
-                                "person_id": person_id,
-                                "signal_seconds": round(signal_seconds, 2),
-                                "bpm": new_result.bpm,
-                                "signal_quality": new_result.signal_quality,
-                                "status": new_result.status,
-                            })
+                            bpm = getattr(result, "bpm", None)
+                            quality = getattr(
+                                result, "signal_quality", None
+                            )
+
+                            with self.lock:
+                                self.rows.append({
+                                    "timestamp": time.time(),
+                                    "person_id": track_id,
+                                    "patient_id": patient_id or "",
+                                    "signal_seconds": round(signal_seconds, 2),
+                                    "bpm": bpm,
+                                    "signal_quality": quality,
+                                    "status": getattr(
+                                        result,
+                                        "status",
+                                        "Estimate generated",
+                                    ),
+                                })
+
+                            self._save_reading(
+                                track_id,
+                                patient_id,
+                                result,
+                            )
+
                     except Exception as exc:
-                        print(f"Estimator error for person {person_id}: {exc}")
+                        print(f"[PulseVision] BPM estimation error: {exc}")
 
-                bpm = result.bpm if result is not None else None
-                quality = result.signal_quality if result is not None else None
+                bpm = getattr(result, "bpm", None) if result else None
+                quality = (
+                    getattr(result, "signal_quality", None)
+                    if result else None
+                )
                 status = (
-                    result.status if result is not None
-                    else "Collecting signal" if signal_seconds < 20.0
-                    else "Waiting for estimate"
+                    getattr(result, "status", "Estimate generated")
+                    if result
+                    else "Collecting signal"
                 )
 
                 polygon = face.get("face_polygon")
                 if polygon is not None:
                     try:
-                        polygon = np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)
-                        if len(polygon) >= 3:
+                        points = np.asarray(
+                            polygon, dtype=np.int32
+                        ).reshape(-1, 1, 2)
+                        if len(points) >= 3:
                             cv2.polylines(
-                                frame, [polygon], True, (105, 160, 125), 2
+                                frame,
+                                [points],
+                                True,
+                                (105, 160, 125),
+                                2,
                             )
                     except (ValueError, TypeError):
                         pass
@@ -270,39 +483,46 @@ class PulseVisionBackend:
                         continue
 
                     try:
-                        box = np.asarray(box, dtype=np.int32).reshape(-1, 2)
-                    except (TypeError, ValueError):
+                        points = np.asarray(
+                            box, dtype=np.int32
+                        ).reshape(-1, 2)
+                    except (ValueError, TypeError):
                         continue
 
-                    if len(box) >= 3:
-                        color = {
-                            "forehead": (110, 170, 145),
-                            "left_cheek": (180, 150, 100),
-                            "right_cheek": (130, 140, 200),
-                        }.get(region.get("name"), (180, 180, 180))
-
+                    if len(points) >= 3:
                         cv2.polylines(
-                            frame, [box.reshape(-1, 1, 2)], True, color, 2
+                            frame,
+                            [points.reshape(-1, 1, 2)],
+                            True,
+                            (110, 170, 145),
+                            2,
                         )
 
                     regions_data.append({
                         "name": region.get("name", "region"),
-                        "box": box.tolist(),
-                        "skin_fraction": float(region.get("skin_fraction", 0)),
+                        "box": points.tolist(),
+                        "skin_fraction": float(
+                            region.get("skin_fraction", 0)
+                        ),
                         "valid": bool(region.get("valid", False)),
                     })
 
                 center_x, center_y = face.get("center", (0, 0))
                 label = (
-                    f"Person {person_id} | {bpm:.1f} BPM"
-                    if bpm is not None and np.isfinite(bpm)
-                    else f"Person {person_id} | {status}"
+                    f"{patient_id} | {bpm:.1f} BPM"
+                    if patient_id
+                    and bpm is not None
+                    and np.isfinite(bpm)
+                    else f"{patient_id or 'Saving face...'} | {status}"
                 )
 
                 cv2.putText(
                     frame,
                     label,
-                    (max(8, int(center_x) - 90), max(20, int(center_y) - 15)),
+                    (
+                        max(8, int(center_x) - 90),
+                        max(20, int(center_y) - 15),
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
                     (245, 245, 235),
@@ -311,7 +531,8 @@ class PulseVisionBackend:
                 )
 
                 people_data.append({
-                    "id": person_id,
+                    "id": track_id,
+                    "patient_id": patient_id,
                     "bpm": bpm,
                     "signal_quality": quality,
                     "status": status,
@@ -320,16 +541,17 @@ class PulseVisionBackend:
                     "regions": regions_data,
                 })
 
-            # JPEG encoding is still required for the browser preview.
-            ok, encoded = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+            success, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 75],
             )
-            if ok:
-                cached_frame_b64 = base64.b64encode(encoded).decode("ascii")
+            if success:
+                cached_frame = base64.b64encode(
+                    encoded.tobytes()
+                ).decode("ascii")
 
-            session_seconds = (
-                frame_time - self.started_at if self.started_at else 0.0
-            )
+            duration = now - self.started_at if self.started_at else 0
 
             with self.lock:
                 self.latest_data = {
@@ -337,11 +559,9 @@ class PulseVisionBackend:
                     "status": "Experimental live processing",
                     "fps": round(self.processing_fps, 1),
                     "people": people_data,
-                    "session_seconds": round(session_seconds, 1),
+                    "session_seconds": round(duration, 1),
                 }
-
-                # Keep the most recent encoded frame for WebSocket clients.
-                self.latest_frame = cached_frame_b64
+                self.latest_frame = cached_frame
 
     def status(self):
         with self.lock:
@@ -357,10 +577,19 @@ async def lifespan(app: FastAPI):
     backend.stop()
 
 
-app = FastAPI(
-    title="PulseVision API",
-    version="0.4.0",
-    lifespan=lifespan,
+app = FastAPI(title="PulseVision API", version="0.8.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -368,8 +597,8 @@ app = FastAPI(
 def health():
     return {
         "ok": True,
-        "service": "PulseVision API",
         "camera_running": backend.running,
+        "face_recognition": "disabled",
     }
 
 
@@ -384,13 +613,85 @@ def start_camera():
         backend.start()
         return {"ok": True, "status": "Camera started"}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/stop")
 def stop_camera():
     backend.stop()
     return {"ok": True, "status": "Camera stopped"}
+
+
+@app.get("/api/patients")
+def list_patients():
+    patients = database.get_all_patients()
+
+    # Don't expose face embeddings to the browser.
+    for patient in patients:
+        patient.pop("face_embedding", None)
+
+    return {"patients": patients, "count": len(patients)}
+
+
+@app.get("/api/patients/{patient_id}")
+def get_patient(patient_id: str):
+    patient = database.get_patient(patient_id)
+
+    if patient is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    patient.pop("face_embedding", None)
+    return patient
+
+
+@app.get("/api/patients/{patient_id}/readings")
+def patient_readings(patient_id: str, limit: int = 500):
+    if database.get_patient(patient_id) is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    return {
+        "readings": database.get_patient_readings(
+            patient_id,
+            limit=limit,
+        )
+    }
+
+
+@app.get("/api/patients/{patient_id}/readings/latest")
+def latest_reading(patient_id: str):
+    if database.get_patient(patient_id) is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    return {"reading": database.get_latest_reading(patient_id)}
+
+
+@app.get("/api/patients/{patient_id}/sessions")
+def patient_sessions(patient_id: str):
+    if database.get_patient(patient_id) is None:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    return {"sessions": database.get_patient_sessions(patient_id)}
+
+
+@app.delete("/api/patients/clear")
+def clear_database():
+    if backend.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop monitoring before resetting the database.",
+        )
+
+    try:
+        return {
+            "ok": True,
+            "message": "Database reset successfully",
+            **database.clear_all_data(),
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database reset failed: {exc}",
+        )
 
 
 @app.get("/api/export.csv")
@@ -402,13 +703,18 @@ def export_csv():
     fields = [
         "timestamp",
         "person_id",
+        "patient_id",
         "signal_seconds",
         "bpm",
         "signal_quality",
         "status",
     ]
 
-    writer = csv.DictWriter(output, fieldnames=fields)
+    writer = csv.DictWriter(
+        output,
+        fieldnames=fields,
+        extrasaction="ignore",
+    )
     writer.writeheader()
     writer.writerows(rows)
     output.seek(0)
@@ -417,7 +723,8 @@ def export_csv():
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={
-            "Content-Disposition": 'attachment; filename="pulsevision_session.csv"'
+            "Content-Disposition":
+                'attachment; filename="pulsevision_session.csv"'
         },
     )
 
@@ -440,4 +747,4 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        print("WebSocket error:", exc)
+        print(f"[PulseVision] WebSocket error: {exc}")
